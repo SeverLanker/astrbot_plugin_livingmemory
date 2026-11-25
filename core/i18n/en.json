@@ -89,7 +89,8 @@
     "no_new": "No new conversations to summarize currently.\nTotal messages: {total}\nLast summarized message index: {index}",
     "starting": "Starting manual memory summarization...\nMessage range: [{start}:{end}], total {count} items",
     "fetch_failed": "Failed to fetch messages: no summarizable messages read.\nPlease confirm the current session has historical messages and retry.",
-    "success": "Memory summarization complete.\nImportance: {importance:.2f}\nTopics: {topics}\nUpdated summarization progress to message {count}"
+    "success": "Memory summarization complete.\nImportance: {importance:.2f}\nTopics: {topics}\nUpdated summarization progress to message {count}",
+    "skipped_no_user_evidence": "This window cannot support user, relationship, or absence facts (no message from the other party, or only assistant speculation). Those facts were not saved. Summarization progress advanced to message {count}."
   },
   "reset": {
     "action_name": "Reset memory context",

@@ -5,6 +5,7 @@ MemoryProcessor 的 MemoryProcessorBuildMixin 拆分模块
 
 from typing import Any
 from .atom_classifier import classify_atoms
+from .source_attribution import blocks_user_fact_storage
 import json
 from ..models.memory_atom import MemoryAtom
 
@@ -82,6 +83,12 @@ class MemoryProcessorBuildMixin:
         It does NOT make additional LLM calls — classification is rule-based.
         """
         if not self.config.get("atom_enabled", True):
+            return []
+        if blocks_user_fact_storage(metadata):
+            metadata["key_facts"] = []
+            metadata["canonical_summary"] = ""
+            metadata["persona_summary"] = ""
+            metadata["atom_types"] = []
             return []
         key_facts: list[str] = metadata.get("key_facts", [])
         if not key_facts:

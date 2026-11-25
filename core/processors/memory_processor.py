@@ -16,6 +16,11 @@ from ..astrbot_compat import get_using_provider
 from ..models.conversation_models import Message
 from .memory_processor_parse import MemoryProcessorParseMixin
 from .memory_processor_build import MemoryProcessorBuildMixin
+from .source_attribution import (
+    empty_unattributed_metadata,
+    evidence_record,
+    select_user_evidence,
+)
 
 class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
     """
@@ -458,8 +463,23 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
         if not messages:
             raise ValueError("消息列表不能为空")
 
-        # 1. 格式化对话历史
-        conversation_text = self._format_conversation(messages)
+        evidence, evidence_messages = select_user_evidence(messages)
+        if evidence.lacks_user_evidence:
+            logger.info(
+                "[MemoryProcessor] 窗口没有用户发言，跳过用户事实提取并推进调用方游标"
+            )
+            metadata = empty_unattributed_metadata(
+                is_group_chat=is_group_chat,
+                evidence=evidence,
+            )
+            metadata["participant_identities"] = self._extract_participant_identities(
+                messages
+            )
+            return "", metadata, 0.0
+
+        # 1. 只把角色上属于对方的消息交给提取模型。
+        # 助手原文仍留在会话里，但不进入这次输入。
+        conversation_text = self._format_conversation(evidence_messages)
 
         # 2. 选择合适的提示词模板（每次从 PromptManager 读取，确保 WebUI 保存后立即生效）
         # 使用 replace 而非 format，避免对话内容中的大括号导致解析错误
@@ -493,7 +513,8 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
             )
             logger.debug(f"[MemoryProcessor] LLM 原始响应内容:\n{llm_response_text}")
 
-            # 4. 解析LLM响应
+            # 4. 解析 LLM 响应。输出是否忠实于用户证据取决于模型，
+            # 这里不再按关键词或原句子串删除改写。
             structured_data = self._parse_llm_response(llm_response_text, is_group_chat)
 
             # 4.5 质量校验
@@ -516,6 +537,7 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
             metadata["participant_identities"] = self._extract_participant_identities(
                 messages
             )
+            metadata["source_attribution"] = evidence_record(evidence)
             content = self._apply_source_time_tags(content, metadata, messages)
             # 将质量标记写入 metadata
             metadata["summary_quality"] = structured_data.get("_quality", "normal")

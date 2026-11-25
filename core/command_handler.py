@@ -23,6 +23,7 @@ from .memory_scope import (
     resolve_memory_scope,
 )
 from .memory_source import serialize_source_messages
+from .processors.source_attribution import blocks_user_fact_storage
 from .validators.index_validator import IndexValidator
 
 
@@ -574,7 +575,14 @@ class CommandHandler:
             except (TypeError, ValueError):
                 last_summarized_index = 0
 
-            if message_count is not None:
+            if message_count is None:
+                bounded = min(max(last_summarized_index, 0), actual_count)
+                if bounded != last_summarized_index:
+                    last_summarized_index = bounded
+                    await self.conversation_manager.update_session_metadata(
+                        session_id, "last_summarized_index", bounded
+                    )
+            else:
                 try:
                     requested_count = int(message_count)
                 except (TypeError, ValueError):
@@ -645,6 +653,20 @@ class CommandHandler:
                 is_group_chat=is_group_chat,
                 persona_id=persona_id,
             )
+            if blocks_user_fact_storage(metadata):
+                await self.conversation_manager.update_session_metadata(
+                    session_id, "last_summarized_index", actual_count
+                )
+                await self.conversation_manager.update_session_metadata(
+                    session_id, "pending_summary", None
+                )
+                yield event.plain_result(
+                    t(
+                        "summarize.skipped_no_user_evidence",
+                        count=actual_count,
+                    )
+                )
+                return
 
             atoms = self._memory_processor.classify_atoms_from_metadata(
                 metadata=metadata,
