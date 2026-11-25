@@ -45,8 +45,8 @@ EXPECTED_BEFORE = {
     "tests/conftest.py": "77388ce77bc9c2080b8dd7eb834d489b1f8087a4b3f8d940b57d2f5bc230de6d",
 }
 EXPECTED_AFTER = {
-    "core/command_handler.py": "cd01a7e28213d02d52e6b7fa6b43977c370f1729364f697ea21b73f224a0d96e",
-    "core/event_handler_modules/memory_reflection.py": "c43f89a2a49083a353cd5d6a09045d8d9a05c88a408c947e93ce5326acc2e7f4",
+    "core/command_handler.py": "6c70e46b4b181c7fdf098ee7f4517d695c9bd6fdaeb942d55176bf1b4ea32993",
+    "core/event_handler_modules/memory_reflection.py": "760655cfd3acd39b6bc9bca209f1ace1bf572672c1dc1ea93a75c594749adf68",
     "core/i18n/en.json": "40ac97ff0ddc8361d87a1427e681450d8ee0d95de0845a6ca836bf24775f7156",
     "core/i18n/ja.json": "eaa32f88e831cc935216a2fb0d316694bff4c181436d7fbbe66de7692f352f10",
     "core/i18n/ru.json": "2a62f840d1e5e8b060d198cd31d4c312f5da7f487b912b5e2ff13d2e1ef624ff",
@@ -55,11 +55,11 @@ EXPECTED_AFTER = {
     "core/page_api_modules/memory_handler.py": "794790070e4b49e7a322456e99048f8bd1de680e25f1ba1a87d401478293e998",
     "core/page_api_modules/memory_handler_io.py": "930046c14dedf0baa2a46c662be24c520a544ac95e16a4d5f17b0807393ef8a5",
     "core/processors/graph_extractor.py": "2bcce3be73f68d6c5a804265f0a87913ffaadebe3cef7de5d1486b93dc967492",
-    "core/processors/memory_processor.py": "97c526d38dc0604af9effca4f742c0f9260755248d6a26227c0a40e9ea5d13a2",
+    "core/processors/memory_processor.py": "8f60451b5ef59c711dc1765351c9749c1c866e6b869b8833fd79a093f8c90ad8",
     "core/processors/memory_processor_build.py": "e497a0dd9a2b1453f53ee4ee237f4eb4a85bad8e9062b48f05c49e79f2943327",
-    "core/processors/source_attribution.py": "b684a454bdf029423b5e09748e3554731ad7f833215e46a011b4eab20d7fd1d4",
+    "core/processors/source_attribution.py": "d816042bbbdabae313b2d49e4c1c5f62d9fd5f60ef3cb0510e581e73a1afbc83",
     "tests/conftest.py": "2b4dbfe5c86a6c8a6e126784dd06b509e0bdb20cf7dcfa3df71f58c0e65b7001",
-    "tests/test_source_attribution.py": "d955505063f7be651c9c0efc20174899affd4568c9ba57702a39f635433ea09f",
+    "tests/test_source_attribution.py": "fa4ec4d0ebbe5884ca47d85b4ccc762f6cbdccabbf9f8f978715856feed60a9a",
 }
 CREATED_FILES = (
     "core/processors/source_attribution.py",

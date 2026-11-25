@@ -575,7 +575,14 @@ class CommandHandler:
             except (TypeError, ValueError):
                 last_summarized_index = 0
 
-            if message_count is not None:
+            if message_count is None:
+                bounded = min(max(last_summarized_index, 0), actual_count)
+                if bounded != last_summarized_index:
+                    last_summarized_index = bounded
+                    await self.conversation_manager.update_session_metadata(
+                        session_id, "last_summarized_index", bounded
+                    )
+            else:
                 try:
                     requested_count = int(message_count)
                 except (TypeError, ValueError):

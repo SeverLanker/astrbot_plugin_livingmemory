@@ -350,21 +350,13 @@ class MemoryReflection:
         trigger_rounds = self.config_manager.get(
             "reflection_engine.summary_trigger_rounds", 10
         )
-        last_summarized_index = await self.conversation_manager.get_session_metadata(
-            session_id, "last_summarized_index", 0
+        last_summarized_index = await self._bounded_summary_cursor(
+            session_id,
+            await self.conversation_manager.get_session_metadata(
+                session_id, "last_summarized_index", 0
+            ),
+            total_messages,
         )
-
-        # 消息被删除后游标可能超出实际消息数；调整为当前总数，而非归零
-        # （避免重复处理已总结的内容）
-        if last_summarized_index > total_messages:
-            logger.warning(
-                f"[DEBUG-Reflection] [{session_id}] last_summarized_index({last_summarized_index}) "
-                f"> 实际消息数({total_messages})，调整为当前消息总数"
-            )
-            last_summarized_index = total_messages
-            await self.conversation_manager.update_session_metadata(
-                session_id, "last_summarized_index", total_messages
-            )
 
         unsummarized_rounds = (total_messages - last_summarized_index) // 2
         pending_summary = await self.conversation_manager.get_session_metadata(
@@ -524,8 +516,12 @@ class MemoryReflection:
         total_messages = await self.conversation_manager.store.get_message_count(
             session_id
         )
-        last_summarized_index = await self.conversation_manager.get_session_metadata(
-            session_id, "last_summarized_index", 0
+        last_summarized_index = await self._bounded_summary_cursor(
+            session_id,
+            await self.conversation_manager.get_session_metadata(
+                session_id, "last_summarized_index", 0
+            ),
+            total_messages,
         )
         pending_summary = await self.conversation_manager.get_session_metadata(
             session_id, "pending_summary", None
@@ -753,6 +749,28 @@ class MemoryReflection:
         await manager.update_session_metadata(session_id, key, value)
         return True
 
+    async def _bounded_summary_cursor(
+        self, session_id: str, raw: Any, total_messages: int
+    ) -> int:
+        """把总结游标收进 ``[0, 消息总数]``。越界或非整数时写回，避免反复重放。"""
+        try:
+            cursor = int(raw)
+        except (TypeError, ValueError):
+            cursor = 0
+        if cursor < 0:
+            cursor = 0
+        if cursor > total_messages:
+            cursor = total_messages
+        if cursor != raw:
+            logger.warning(
+                f"[DEBUG-Reflection] [{session_id}] last_summarized_index({raw}) "
+                f"超出 [0, {total_messages}]，调整为 {cursor}"
+            )
+            await self.conversation_manager.update_session_metadata(
+                session_id, "last_summarized_index", cursor
+            )
+        return cursor
+
     async def _commit_summary_cursor(
         self, session_id: str, end_index: int, expected_revision: int | None
     ) -> bool:
@@ -873,6 +891,17 @@ class MemoryReflection:
                 )
 
                 # 使用 MemoryProcessor 处理对话历史
+                if not history_messages:
+                    logger.info(
+                        f"[{session_id}] 总结窗口没有消息，跳过写入并推进游标 "
+                        f"[{start_index}:{end_index}]"
+                    )
+                    if self.conversation_manager is None:
+                        return False
+                    return await self._commit_summary_cursor(
+                        session_id, end_index, expected_revision
+                    )
+
                 if not self.memory_processor:
                     logger.error(f"[{session_id}] MemoryProcessor 未初始化，记录待重试")
                     await self._record_pending_summary(

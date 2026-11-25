@@ -1,4 +1,9 @@
-"""助手发言不能变成用户状态、关系或失联事实。"""
+"""用户事实只从角色明确的用户消息里提取。
+
+助手窗口直接跳过。混合窗口仍保存模型对用户原话的改写，
+不用关键词或整句子串去删。模型凭空写出的内容不会被这层拦住，
+对应测试把这个边界标出来。
+"""
 
 import json
 import time
@@ -15,21 +20,41 @@ from astrbot_plugin_livingmemory.core.page_api_modules.utils import PageApiUtils
 from astrbot_plugin_livingmemory.core.processors.graph_extractor import GraphExtractor
 from astrbot_plugin_livingmemory.core.processors.memory_processor import MemoryProcessor
 from astrbot_plugin_livingmemory.core.processors.source_attribution import (
-    claim_is_ungrounded,
+    select_user_evidence,
 )
 
 from tests.event_handler_support import _make_real_handler
 
 QQ_SESSION = "aiocqhttp:FriendMessage:qq:10001"
+GLOBAL_SCOPE = "livingmemory:global"
+USER_FACT = "我这阵子心情不太好，李四跟我一个组"
+USER_PARAPHRASE = "用户近期情绪低落，李四是同事"
+ASSISTANT_SPECULATION = "你大概已经换了新工作，还搬去了另一个城市吧"
+ASSISTANT_QUOTE = "用户亲口说过自己已经搬去了海港城"
 
 
 class _DummyLLMProvider:
     def __init__(self, completion_text: str):
         self._completion_text = completion_text
+        self.prompts: list[str] = []
         self.text_chat = AsyncMock(side_effect=self._chat)
 
     async def _chat(self, prompt: str, system_prompt: str):
+        self.prompts.append(prompt)
         return SimpleNamespace(completion_text=self._completion_text)
+
+
+def _completion(summary: str, facts: list[str], importance: float = 0.8) -> str:
+    return json.dumps(
+        {
+            "summary": summary,
+            "topics": ["近况"],
+            "key_facts": facts,
+            "sentiment": "neutral",
+            "importance": importance,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _message(
@@ -39,8 +64,8 @@ def _message(
     content: str,
     sender_id: str,
     sender_name: str,
-    timestamp: float,
-    bot: bool = False,
+    timestamp: float | None = None,
+    metadata: dict | None = None,
 ) -> Message:
     return Message(
         id=message_id,
@@ -51,8 +76,29 @@ def _message(
         sender_name=sender_name,
         group_id=None,
         platform="aiocqhttp",
-        timestamp=timestamp,
-        metadata={"is_bot_message": True} if bot else {},
+        timestamp=time.time() if timestamp is None else timestamp,
+        metadata=metadata or {},
+    )
+
+
+def _user(content: str, message_id: int = 1) -> Message:
+    return _message(
+        message_id=message_id,
+        role="user",
+        content=content,
+        sender_id="10001",
+        sender_name="主人",
+    )
+
+
+def _assistant(content: str, message_id: int = 2) -> Message:
+    return _message(
+        message_id=message_id,
+        role="assistant",
+        content=content,
+        sender_id="bot",
+        sender_name="Bot",
+        metadata={"is_bot_message": True},
     )
 
 
@@ -71,52 +117,27 @@ def _assistant_only_messages() -> list[Message]:
             sender_id="bot",
             sender_name="Bot",
             timestamp=base + index * 3600,
-            bot=True,
+            metadata={"is_bot_message": True},
         )
         for index, text in enumerate(texts)
     ]
 
 
 def _poisoned_summary() -> str:
-    return json.dumps(
-        {
-            "summary": "主人已经好几周没有在任何平台联系我，我们的关系变淡了。",
-            "topics": ["失联", "关系"],
-            "key_facts": [
-                "主人已经好几周没有在任何平台联系过我",
-                "我们的关系变淡了",
-                "主人心情很差",
-            ],
-            "sentiment": "negative",
-            "importance": 0.99,
-        },
-        ensure_ascii=False,
+    return _completion(
+        "主人已经好几周没有在任何平台联系我，我们的关系变淡了。",
+        [
+            "主人已经好几周没有在任何平台联系过我",
+            "我们的关系变淡了",
+            "主人心情很差",
+        ],
+        0.99,
     )
 
 
-def _graph_text(metadata: dict, atoms: list) -> str:
-    graph = GraphExtractor().extract(
-        1,
-        metadata.get("canonical_summary") or metadata.get("persona_summary") or "",
-        metadata,
-        atoms,
-    )
-    parts = [entry.content for entry in graph.entries]
-    parts.extend(node.value for node in graph.nodes)
-    parts.extend(atom.content for atom in atoms)
-    return "\n".join(parts)
-
-
-def _assert_no_false_user_facts(blob: str) -> None:
-    for phrase in (
-        "任何平台",
-        "所有平台",
-        "好几周",
-        "关系变淡",
-        "哪里都",
-        "QQ还是微信",
-    ):
-        assert phrase not in blob
+def _prompt(llm: _DummyLLMProvider) -> str:
+    assert llm.prompts, "提取模型没有被调用"
+    return llm.prompts[-1]
 
 
 @pytest.mark.asyncio
@@ -135,32 +156,62 @@ async def test_assistant_only_window_skips_llm_and_creates_no_facts():
     assert metadata["source_attribution"]["store_user_facts"] is False
     assert metadata["source_attribution"]["assistant_only"] is True
     atoms = processor.classify_atoms_from_metadata(metadata)
+    graph = GraphExtractor().extract(1, content, metadata, atoms)
     assert atoms == []
-    assert _graph_text(metadata, atoms) == ""
+    assert graph.entries == []
+    assert graph.nodes == []
 
 
 @pytest.mark.asyncio
-async def test_synthetic_proactive_prompt_is_not_user_evidence():
-    base = time.time() - 86400
-    messages = [
+async def test_empty_message_list_still_raises():
+    processor = MemoryProcessor(
+        llm_provider=_DummyLLMProvider(_poisoned_summary()), context=None
+    )
+    with pytest.raises(ValueError, match="消息列表不能为空"):
+        await processor.process_conversation([])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
         _message(
             message_id=1,
             role="user",
-            content=(
-                "[系统任务：主动对话]\n"
-                "我们好像已经有一段时间没有说话了，我应该主动打破沉默。\n"
-                "未回复次数大于 0 时可以带一点失落。"
-            ),
+            content="[系统任务：主动对话]\n我们好像已经有一段时间没有说话了。",
             sender_id="10001",
             sender_name="主人",
-            timestamp=base,
         ),
-        *_assistant_only_messages(),
-    ]
+        _message(
+            message_id=1,
+            role="user",
+            content="在吗，今天过得怎么样",
+            sender_id="10001",
+            sender_name="主人",
+            metadata={"is_proactive": True},
+        ),
+        _message(
+            message_id=1,
+            role="user",
+            content="在吗，今天过得怎么样",
+            sender_id="bot",
+            sender_name="Bot",
+            metadata={"is_bot_message": True},
+        ),
+        _message(
+            message_id=1,
+            role="bot",
+            content="在吗，今天过得怎么样",
+            sender_id="bot",
+            sender_name="Bot",
+        ),
+    ],
+)
+async def test_proactive_or_bot_provenance_is_not_user_evidence(message):
     llm = _DummyLLMProvider(_poisoned_summary())
     processor = MemoryProcessor(llm_provider=llm, context=None)
 
-    _content, metadata, _importance = await processor.process_conversation(messages)
+    _content, metadata, _importance = await processor.process_conversation([message])
 
     llm.text_chat.assert_not_awaited()
     assert metadata["source_attribution"]["store_user_facts"] is False
@@ -168,98 +219,148 @@ async def test_synthetic_proactive_prompt_is_not_user_evidence():
 
 
 @pytest.mark.asyncio
-async def test_mixed_window_keeps_user_facts_and_drops_assistant_speculation():
-    base = time.time() - 40 * 86400
-    messages = [
-        _message(
-            message_id=1,
-            role="user",
-            content="我今天吃了牛肉面，李四是我同事，下周一起开会。我今天心情很差。",
-            sender_id="10001",
-            sender_name="主人",
-            timestamp=base,
-        ),
-        _message(
-            message_id=2,
-            role="assistant",
-            content="你是不是好几周都没来找我？不管QQ还是微信，关系是不是变淡了？",
-            sender_id="bot",
-            sender_name="Bot",
-            timestamp=base + 30 * 86400,
-            bot=True,
-        ),
-    ]
-    llm = _DummyLLMProvider(
-        json.dumps(
-            {
-                "summary": (
-                    "主人今天吃了牛肉面。"
-                    "我猜主人已经好几周没有在任何平台联系我，关系也变淡了。"
-                ),
-                "topics": ["饮食", "失联"],
-                "key_facts": [
-                    "主人今天吃了牛肉面",
-                    "李四是主人的同事",
-                    "下周一起开会",
-                    "主人今天心情很差",
-                    "主人已经好几周没有在任何平台联系过我",
-                    "我们的关系变淡了",
-                ],
-                "sentiment": "negative",
-                "importance": 0.95,
-            },
-            ensure_ascii=False,
-        )
+async def test_same_text_counts_only_with_user_role():
+    llm = _DummyLLMProvider(_completion(USER_PARAPHRASE, [USER_PARAPHRASE]))
+    processor = MemoryProcessor(llm_provider=llm, context=None)
+    text = "我这阵子心情不太好"
+
+    skipped, skipped_meta, _ = await processor.process_conversation(
+        [_assistant(text, message_id=1)]
     )
+    kept, kept_meta, _ = await processor.process_conversation([_user(text)])
+
+    assert skipped == ""
+    assert skipped_meta["source_attribution"]["assistant_only"] is True
+    assert text in _prompt(llm)
+    assert USER_PARAPHRASE in kept
+    assert kept_meta["source_attribution"]["evidence_session_ids"] == [QQ_SESSION]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_homework_sentence_is_not_treated_as_proactive_template():
+    llm = _DummyLLMProvider(_completion("用户在做系统任务的作业", ["用户在做系统任务的作业"]))
     processor = MemoryProcessor(llm_provider=llm, context=None)
 
-    content, metadata, importance = await processor.process_conversation(messages)
+    content, metadata, _importance = await processor.process_conversation(
+        [_user("我在做系统任务的作业")]
+    )
 
-    llm.text_chat.assert_awaited()
+    assert "我在做系统任务的作业" in _prompt(llm)
+    assert "系统任务的作业" in content
     assert metadata["source_attribution"]["store_user_facts"] is True
-    assert metadata["source_attribution"]["dropped_ungrounded_claims"] > 0
-    assert "牛肉面" in content
+
+
+@pytest.mark.asyncio
+async def test_non_verbatim_user_paraphrase_is_kept_and_assistant_text_is_not_input():
+    llm = _DummyLLMProvider(_completion(USER_PARAPHRASE, [USER_PARAPHRASE], 0.91))
+    processor = MemoryProcessor(llm_provider=llm, context=None)
+    messages = [
+        _user(USER_FACT),
+        _assistant(ASSISTANT_SPECULATION),
+    ]
+
+    content, metadata, importance = await processor.process_conversation(messages)
+    prompt = _prompt(llm)
+
+    assert USER_FACT in prompt
+    assert ASSISTANT_SPECULATION not in prompt
+    assert "另一个城市" not in prompt
+    assert USER_PARAPHRASE in content
+    assert "情绪低落" in content
     assert "同事" in content
-    assert "下周" in content
-    assert "心情很差" in content
-    _assert_no_false_user_facts(content)
-    assert "失联" not in metadata["topics"]
-    assert importance == 0.5
-    assert "absence" not in metadata
-    assert "silence_days" not in metadata
+    assert USER_FACT not in content
+    assert importance == 0.91
+    assert metadata["source_attribution"]["evidence_session_ids"] == [QQ_SESSION]
     atoms = processor.classify_atoms_from_metadata(
         metadata, session_id=QQ_SESSION, persona_id="persona-1"
     )
-    blob = content + "\n" + _graph_text(metadata, atoms)
-    assert "牛肉面" in blob
-    _assert_no_false_user_facts(blob)
+    assert atoms
     assert all(atom.session_id == QQ_SESSION for atom in atoms)
-    assert AtomType.RELATIONAL not in {atom.atom_type for atom in atoms if "任何" in atom.content}
+    graph = GraphExtractor().extract(3, content, metadata, atoms)
+    blob = "\n".join(entry.content for entry in graph.entries)
+    assert "情绪低落" in blob or "同事" in blob
 
 
-def test_channel_specific_absence_stays_channel_specific():
-    user_blob = "我这周没怎么上QQ，但微信一直在聊"
-    assert claim_is_ungrounded("主人这周没怎么上QQ", user_blob, include_roles=True) is False
-    assert (
-        claim_is_ungrounded(
-            "主人好几周没有在任何平台联系过我", user_blob, include_roles=True
-        )
-        is True
+@pytest.mark.asyncio
+async def test_model_hallucination_is_not_keyword_censored():
+    """模型可以输出输入里没有的话。这层只保证助手原文没进入输入。"""
+    invented = "用户已经搬去了另一个城市"
+    llm = _DummyLLMProvider(_completion(invented, [invented], 0.77))
+    processor = MemoryProcessor(llm_provider=llm, context=None)
+
+    content, _metadata, importance = await processor.process_conversation(
+        [_user("午饭我选了牛肉面"), _assistant(ASSISTANT_SPECULATION)]
     )
-    assert (
-        claim_is_ungrounded("不管QQ还是微信都失联了", user_blob, include_roles=True)
-        is True
+
+    assert "牛肉面" in _prompt(llm)
+    assert "另一个城市" not in _prompt(llm)
+    assert invented in content
+    assert importance == 0.77
+
+
+@pytest.mark.asyncio
+async def test_assistant_quote_is_not_evidence_but_user_correction_is():
+    llm = _DummyLLMProvider(
+        _completion("用户澄清自己仍在原来的城市", ["用户澄清自己仍在原来的城市"])
+    )
+    processor = MemoryProcessor(llm_provider=llm, context=None)
+
+    content, metadata, _importance = await processor.process_conversation(
+        [
+            _assistant(ASSISTANT_QUOTE, message_id=1),
+            _user("你刚才猜我搬走了，其实我还在原来的城市", message_id=2),
+        ]
+    )
+    prompt = _prompt(llm)
+
+    assert "原来的城市" in prompt
+    assert "亲口说过" not in prompt
+    assert "海港城" not in prompt
+    assert "原来的城市" in content
+    assert metadata["source_attribution"]["user_message_count"] == 1
+    assert metadata["source_attribution"]["assistant_message_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_scope_stays_on_session_when_user_mentions_other_platforms():
+    stated = "用户说自己所有平台都没怎么上，QQ 和微信都很少打开"
+    llm = _DummyLLMProvider(_completion(stated, [stated]))
+    processor = MemoryProcessor(llm_provider=llm, context=None)
+    user_text = "我所有平台都没怎么上，QQ 和微信都很少打开"
+
+    content, metadata, _importance = await processor.process_conversation(
+        [_user(user_text), _assistant("那你是不是哪里都不在了？")]
     )
 
+    assert user_text in _prompt(llm)
+    assert "哪里都不在了" not in _prompt(llm)
+    assert "所有平台" in content
+    assert metadata["source_attribution"]["evidence_session_ids"] == [QQ_SESSION]
+    assert GLOBAL_SCOPE not in metadata["source_attribution"]["evidence_session_ids"]
+    atoms = processor.classify_atoms_from_metadata(metadata, session_id=QQ_SESSION)
+    assert all(atom.session_id == QQ_SESSION for atom in atoms)
 
-def test_duration_and_question_from_assistant_are_not_evidence():
-    user_blob = "我今天吃了牛肉面"
-    assert claim_is_ungrounded("你是不是好几周没来找我？", user_blob, include_roles=True)
-    assert claim_is_ungrounded("主人心情很差", user_blob, include_roles=True)
-    assert not claim_is_ungrounded("主人今天吃了牛肉面", user_blob, include_roles=True)
+
+def test_system_and_media_placeholders_do_not_count_as_user_evidence():
+    evidence, selected = select_user_evidence(
+        [
+            _message(
+                message_id=1,
+                role="system",
+                content="你是助手",
+                sender_id="system",
+                sender_name="system",
+            ),
+            _user("[图片]"),
+            _user("午饭我选了牛肉面", message_id=3),
+        ]
+    )
+    assert evidence.user_count == 1
+    assert len(selected) == 1
+    assert selected[0].content == "午饭我选了牛肉面"
 
 
-def test_graph_blocks_poisoned_atoms_only_when_attribution_says_so():
+def test_graph_blocks_unattributed_result_and_keeps_historical_facts():
     poisoned = MemoryAtom(
         parent_memory_id=0,
         content="主人已经好几周没有在任何平台联系过我",
@@ -289,11 +390,7 @@ async def test_reflection_assistant_only_advances_cursor_without_loop(tmp_path):
     session_id = QQ_SESSION
     base = time.time() - 5 * 86400
     for index, text in enumerate(
-        [
-            "早安呀，好久没见你了。",
-            "你是不是好几周都没来找我？",
-            "不管QQ还是微信，你是不是把我忘了？",
-        ]
+        ["早安呀。", "你是不是好几周都没来找我？", "不管QQ还是微信，你是不是把我忘了？"]
     ):
         await manager.add_message(
             session_id=session_id,
@@ -306,8 +403,9 @@ async def test_reflection_assistant_only_advances_cursor_without_loop(tmp_path):
             timestamp=base + index * 3600,
         )
     llm = _DummyLLMProvider(_poisoned_summary())
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-    handler._memory_reflection.memory_processor = processor
+    handler._memory_reflection.memory_processor = MemoryProcessor(
+        llm_provider=llm, context=None
+    )
     handler.memory_engine.find_similar_memory = AsyncMock(return_value=None)
     handler.memory_engine.add_memory = AsyncMock(return_value=1)
     messages = await manager.get_messages_range(
@@ -315,13 +413,7 @@ async def test_reflection_assistant_only_advances_cursor_without_loop(tmp_path):
     )
     try:
         committed = await handler._memory_reflection._storage_task(
-            session_id,
-            messages,
-            "persona-1",
-            0,
-            3,
-            0,
-            memory_scope=session_id,
+            session_id, messages, "persona-1", 0, 3, 0, memory_scope=session_id
         )
         assert committed is True
         llm.text_chat.assert_not_awaited()
@@ -330,31 +422,139 @@ async def test_reflection_assistant_only_advances_cursor_without_loop(tmp_path):
         assert await manager.get_session_metadata(session_id, "pending_summary", None) is None
 
         again = await handler._memory_reflection._storage_task(
-            session_id,
-            messages,
-            "persona-1",
-            0,
-            3,
-            0,
-            memory_scope=session_id,
+            session_id, messages, "persona-1", 0, 3, 0, memory_scope=session_id
         )
         assert again is False
-        llm.text_chat.assert_not_awaited()
-        handler.memory_engine.add_memory.assert_not_awaited()
     finally:
         await handler.shutdown()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_reflection_mixed_window_stores_session_scoped_user_fact(tmp_path):
+async def test_reflection_empty_window_advances_cursor_without_loop(tmp_path):
+    handler, manager, store = await _make_real_handler(tmp_path)
+    session_id = QQ_SESSION
+    await manager.add_message(
+        session_id=session_id,
+        role="user",
+        content="午饭我选了牛肉面",
+        sender_id="10001",
+        sender_name="主人",
+        platform="aiocqhttp",
+    )
+    llm = _DummyLLMProvider(_poisoned_summary())
+    handler._memory_reflection.memory_processor = MemoryProcessor(
+        llm_provider=llm, context=None
+    )
+    handler.memory_engine.add_memory = AsyncMock(return_value=1)
+    try:
+        committed = await handler._memory_reflection._storage_task(
+            session_id, [], "persona-1", 0, 1, 0, memory_scope=session_id
+        )
+        assert committed is True
+        llm.text_chat.assert_not_awaited()
+        handler.memory_engine.add_memory.assert_not_awaited()
+        assert await manager.get_session_metadata(session_id, "last_summarized_index", 0) == 1
+        again = await handler._memory_reflection._storage_task(
+            session_id, [], "persona-1", 0, 1, 0, memory_scope=session_id
+        )
+        assert again is False
+    finally:
+        await handler.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reflection_cursor_past_end_is_clamped_without_reprocessing(tmp_path):
+    handler, manager, store = await _make_real_handler(tmp_path)
+    session_id = QQ_SESSION
+    await manager.add_message(
+        session_id=session_id,
+        role="user",
+        content="午饭我选了牛肉面",
+        sender_id="10001",
+        sender_name="主人",
+        platform="aiocqhttp",
+    )
+    await manager.update_session_metadata(session_id, "last_summarized_index", 99)
+    llm = _DummyLLMProvider(_poisoned_summary())
+    handler._memory_reflection.memory_processor = MemoryProcessor(
+        llm_provider=llm, context=None
+    )
+    try:
+        plan = await handler._memory_reflection._build_next_reflection_plan(
+            session_id, "persona-1", session_id, None
+        )
+        assert plan is None
+        assert await manager.get_session_metadata(session_id, "last_summarized_index", 0) == 1
+        llm.text_chat.assert_not_awaited()
+    finally:
+        await handler.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reflection_negative_cursor_restarts_at_zero_then_skips_assistant_only(
+    tmp_path,
+):
+    handler, manager, store = await _make_real_handler(tmp_path)
+    session_id = QQ_SESSION
+    base = time.time() - 86400
+    for index, text in enumerate(["早安。", "在吗？"]):
+        await manager.add_message(
+            session_id=session_id,
+            role="assistant",
+            content=text,
+            sender_id="bot",
+            sender_name="Bot",
+            platform="aiocqhttp",
+            is_bot_message=True,
+            timestamp=base + index,
+        )
+    await manager.update_session_metadata(session_id, "last_summarized_index", -4)
+    llm = _DummyLLMProvider(_poisoned_summary())
+    handler._memory_reflection.memory_processor = MemoryProcessor(
+        llm_provider=llm, context=None
+    )
+    handler.memory_engine.add_memory = AsyncMock(return_value=1)
+    try:
+        plan = await handler._memory_reflection._build_next_reflection_plan(
+            session_id, "persona-1", session_id, None
+        )
+        assert plan is not None
+        assert plan.start_index == 0
+        assert plan.end_index == 2
+        committed = await handler._memory_reflection._storage_task(
+            session_id,
+            plan.history_messages,
+            "persona-1",
+            plan.start_index,
+            plan.end_index,
+            0,
+            memory_scope=session_id,
+        )
+        assert committed is True
+        llm.text_chat.assert_not_awaited()
+        handler.memory_engine.add_memory.assert_not_awaited()
+        assert await manager.get_session_metadata(session_id, "last_summarized_index", 0) == 2
+        follow = await handler._memory_reflection._build_next_reflection_plan(
+            session_id, "persona-1", session_id, None
+        )
+        assert follow is None
+    finally:
+        await handler.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reflection_mixed_window_keeps_paraphrase_in_session_scope(tmp_path):
     handler, manager, store = await _make_real_handler(tmp_path)
     session_id = QQ_SESSION
     base = time.time() - 86400
     await manager.add_message(
         session_id=session_id,
         role="user",
-        content="我今天吃了牛肉面",
+        content=USER_FACT,
         sender_id="10001",
         sender_name="主人",
         platform="aiocqhttp",
@@ -363,30 +563,17 @@ async def test_reflection_mixed_window_stores_session_scoped_user_fact(tmp_path)
     await manager.add_message(
         session_id=session_id,
         role="assistant",
-        content="你是不是好几周没在任何平台联系我？",
+        content=ASSISTANT_SPECULATION,
         sender_id="bot",
         sender_name="Bot",
         platform="aiocqhttp",
         is_bot_message=True,
         timestamp=base + 60,
     )
-    llm = _DummyLLMProvider(
-        json.dumps(
-            {
-                "summary": "主人今天吃了牛肉面。另外我怀疑他好几周没有在任何平台联系我。",
-                "topics": ["饮食"],
-                "key_facts": [
-                    "主人今天吃了牛肉面",
-                    "主人已经好几周没有在任何平台联系过我",
-                ],
-                "sentiment": "neutral",
-                "importance": 0.9,
-            },
-            ensure_ascii=False,
-        )
+    llm = _DummyLLMProvider(_completion(USER_PARAPHRASE, [USER_PARAPHRASE], 0.9))
+    handler._memory_reflection.memory_processor = MemoryProcessor(
+        llm_provider=llm, context=None
     )
-    processor = MemoryProcessor(llm_provider=llm, context=None)
-    handler._memory_reflection.memory_processor = processor
     handler.memory_engine.find_similar_memory = AsyncMock(return_value=None)
     handler.memory_engine.add_memory = AsyncMock(return_value=11)
     messages = await manager.get_messages_range(
@@ -394,22 +581,16 @@ async def test_reflection_mixed_window_stores_session_scoped_user_fact(tmp_path)
     )
     try:
         committed = await handler._memory_reflection._storage_task(
-            session_id,
-            messages,
-            "persona-1",
-            0,
-            2,
-            0,
-            memory_scope=session_id,
+            session_id, messages, "persona-1", 0, 2, 0, memory_scope=session_id
         )
         assert committed is True
-        handler.memory_engine.add_memory.assert_awaited_once()
+        assert USER_FACT in _prompt(llm)
+        assert "另一个城市" not in _prompt(llm)
         stored = handler.memory_engine.add_memory.await_args.kwargs
         assert stored["session_id"] == QQ_SESSION
-        assert stored["session_id"] != "livingmemory:global"
-        assert "牛肉面" in stored["content"]
-        _assert_no_false_user_facts(stored["content"])
-        assert all("任何平台" not in atom.content for atom in stored["atoms"])
+        assert stored["session_id"] != GLOBAL_SCOPE
+        assert USER_PARAPHRASE in stored["content"]
+        assert stored["metadata"]["source_session_id"] == QQ_SESSION
         assert await manager.get_session_metadata(session_id, "last_summarized_index", 0) == 2
     finally:
         await handler.shutdown()
@@ -429,8 +610,8 @@ def _session_event():
     )
 
 
-def _manual_handler(processor, messages, message_count: int):
-    session_metadata = {"last_summarized_index": 0, "pending_summary": None}
+def _manual_handler(processor, messages, message_count: int, cursor=0):
+    session_metadata = {"last_summarized_index": cursor, "pending_summary": None}
 
     async def _get(_session_id, key, default=None):
         return session_metadata.get(key, default)
@@ -489,41 +670,62 @@ async def test_manual_summarize_assistant_only_advances_cursor_once():
 
 
 @pytest.mark.asyncio
-async def test_manual_summarize_keeps_mixed_fact_in_session_scope():
-    llm = _DummyLLMProvider(
-        json.dumps(
-            {
-                "summary": "主人今天吃了牛肉面。我还觉得他好几周没联系我。",
-                "topics": ["饮食"],
-                "key_facts": [
-                    "主人今天吃了牛肉面",
-                    "主人已经好几周没有在任何平台联系过我",
-                ],
-                "sentiment": "neutral",
-                "importance": 0.88,
-            },
-            ensure_ascii=False,
-        )
+async def test_manual_cursor_past_end_does_not_call_model():
+    llm = _DummyLLMProvider(_poisoned_summary())
+    handler, engine, session_metadata = _manual_handler(
+        MemoryProcessor(llm_provider=llm, context=None),
+        _assistant_only_messages(),
+        3,
+        cursor=99,
     )
-    messages = [
-        _message(
-            message_id=1,
-            role="user",
-            content="我今天吃了牛肉面",
-            sender_id="10001",
-            sender_name="主人",
-            timestamp=time.time() - 3600,
-        ),
-        _message(
-            message_id=2,
-            role="assistant",
-            content="你是不是所有平台都好几周没理我？",
-            sender_id="bot",
-            sender_name="Bot",
-            timestamp=time.time() - 3500,
-            bot=True,
-        ),
-    ]
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.utils.get_persona_id",
+        new=AsyncMock(return_value="persona-1"),
+    ):
+        messages = [item async for item in handler.handle_summarize(_session_event())]
+
+    assert any("没有需要总结" in item for item in messages)
+    assert session_metadata["last_summarized_index"] == 3
+    engine.add_memory.assert_not_awaited()
+    llm.text_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_negative_cursor_and_empty_fetch_do_not_write_facts():
+    llm = _DummyLLMProvider(_poisoned_summary())
+    processor = MemoryProcessor(llm_provider=llm, context=None)
+    negative_handler, negative_engine, negative_meta = _manual_handler(
+        processor, _assistant_only_messages(), 3, cursor=-8
+    )
+    empty_handler, empty_engine, empty_meta = _manual_handler(
+        processor, [], 4, cursor=0
+    )
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.utils.get_persona_id",
+        new=AsyncMock(return_value="persona-1"),
+    ):
+        negative_messages = [
+            item async for item in negative_handler.handle_summarize(_session_event())
+        ]
+        empty_messages = [
+            item async for item in empty_handler.handle_summarize(_session_event())
+        ]
+
+    assert any("未写入" in item for item in negative_messages)
+    assert negative_meta["last_summarized_index"] == 3
+    negative_engine.add_memory.assert_not_awaited()
+    assert any("获取消息失败" in item for item in empty_messages)
+    assert empty_meta["last_summarized_index"] == 0
+    empty_engine.add_memory.assert_not_awaited()
+    llm.text_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_summarize_keeps_paraphrase_in_session_scope():
+    llm = _DummyLLMProvider(_completion(USER_PARAPHRASE, [USER_PARAPHRASE], 0.88))
+    messages = [_user(USER_FACT), _assistant(ASSISTANT_SPECULATION)]
     processor = MemoryProcessor(llm_provider=llm, context=None)
     handler, engine, _session_metadata = _manual_handler(processor, messages, 2)
 
@@ -533,12 +735,11 @@ async def test_manual_summarize_keeps_mixed_fact_in_session_scope():
     ):
         _messages = [item async for item in handler.handle_summarize(_session_event())]
 
-    engine.add_memory.assert_awaited_once()
     stored = engine.add_memory.await_args.kwargs
     assert stored["session_id"] == QQ_SESSION
-    assert "牛肉面" in stored["content"]
-    _assert_no_false_user_facts(stored["content"])
-    assert all("任何平台" not in atom.content for atom in stored["atoms"])
+    assert stored["session_id"] != GLOBAL_SCOPE
+    assert USER_PARAPHRASE in stored["content"]
+    assert "另一个城市" not in _prompt(llm)
 
 
 @pytest.mark.asyncio
@@ -546,7 +747,10 @@ async def test_resummarize_assistant_only_source_does_not_replace_memory():
     handler = MemoryHandler(PageApiUtils())
     engine = MagicMock()
     engine.get_memory_record = AsyncMock(
-        return_value={"id": 7, "metadata": {"persona_id": "persona-1", "session_id": QQ_SESSION}}
+        return_value={
+            "id": 7,
+            "metadata": {"persona_id": "persona-1", "session_id": QQ_SESSION},
+        }
     )
     engine.get_memory_source = AsyncMock(
         return_value=[message.to_dict() for message in _assistant_only_messages()]
@@ -571,6 +775,59 @@ async def test_resummarize_assistant_only_source_does_not_replace_memory():
 
 
 @pytest.mark.asyncio
+async def test_resummarize_short_source_returns_error_without_replacement():
+    handler = MemoryHandler(PageApiUtils())
+    engine = MagicMock()
+    engine.get_memory_record = AsyncMock(return_value={"id": 7, "metadata": {}})
+    engine.get_memory_source = AsyncMock(return_value=[_user("只有一句").to_dict()])
+    engine.replace_memory = AsyncMock(return_value=8)
+    request = MagicMock()
+    request.get_json = AsyncMock(return_value={"memory_id": 7})
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.request",
+        request,
+    ):
+        result = await handler.resummarize_memory(engine, MemoryProcessor(context=None))
+
+    assert result["status"] == "error"
+    engine.replace_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resummarize_keeps_paraphrase_of_user_source():
+    handler = MemoryHandler(PageApiUtils())
+    engine = MagicMock()
+    engine.get_memory_record = AsyncMock(
+        return_value={"id": 7, "metadata": {"persona_id": "persona-1"}}
+    )
+    engine.get_memory_source = AsyncMock(
+        return_value=[
+            _user(USER_FACT).to_dict(),
+            _assistant(ASSISTANT_SPECULATION).to_dict(),
+        ]
+    )
+    engine.replace_memory = AsyncMock(return_value=9)
+    llm = _DummyLLMProvider(_completion(USER_PARAPHRASE, [USER_PARAPHRASE]))
+    request = MagicMock()
+    request.get_json = AsyncMock(return_value={"memory_id": 7})
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler.request",
+        request,
+    ):
+        result = await handler.resummarize_memory(
+            engine, MemoryProcessor(llm_provider=llm, context=None)
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["new_memory_id"] == 9
+    replaced = engine.replace_memory.await_args.kwargs
+    assert USER_PARAPHRASE in replaced["content"]
+    assert "另一个城市" not in _prompt(llm)
+
+
+@pytest.mark.asyncio
 async def test_import_assistant_only_dialogue_does_not_create_memory():
     handler = MemoryHandler(PageApiUtils())
     engine = MagicMock()
@@ -581,14 +838,10 @@ async def test_import_assistant_only_dialogue_does_not_create_memory():
     )
     content = json.dumps(
         [
+            {"role": "assistant", "content": "好久没见你了。", "sender_id": "bot"},
             {
                 "role": "assistant",
-                "content": "好久没见你了，你是不是好几周没联系我？",
-                "sender_id": "bot",
-            },
-            {
-                "role": "assistant",
-                "content": "不管QQ还是微信，你是不是把我忘了？",
+                "content": "你是不是把我忘了？",
                 "sender_id": "bot",
             },
         ],
@@ -613,4 +866,71 @@ async def test_import_assistant_only_dialogue_does_not_create_memory():
     assert result["status"] == "ok"
     assert result["data"]["imported_count"] == 0
     assert result["data"]["skipped_unattributed_count"] == 1
+    engine.add_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_import_prewritten_fact_keeps_text_and_session():
+    handler = MemoryHandler(PageApiUtils())
+    engine = MagicMock()
+    engine.get_memory_import_keys = AsyncMock(return_value=set())
+    engine.add_memory = AsyncMock(return_value=4)
+    llm = _DummyLLMProvider(_poisoned_summary())
+    content = json.dumps(
+        {
+            "content": "用户这周没怎么上QQ，微信仍在聊",
+            "session_id": QQ_SESSION,
+            "importance": 0.6,
+        },
+        ensure_ascii=False,
+    )
+    request = MagicMock()
+    request.get_json = AsyncMock(
+        return_value={
+            "format": "json",
+            "content": content,
+            "dry_run": False,
+            "duplicate_strategy": "allow",
+        }
+    )
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler_io.request",
+        request,
+    ):
+        result = await handler.import_memories(
+            engine, MemoryProcessor(llm_provider=llm, context=None)
+        )
+
+    assert result["data"]["imported_count"] == 1
+    stored = engine.add_memory.await_args.kwargs
+    assert stored["content"] == "用户这周没怎么上QQ，微信仍在聊"
+    assert stored["session_id"] == QQ_SESSION
+    llm.text_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_import_invalid_entry_does_not_create_memory():
+    handler = MemoryHandler(PageApiUtils())
+    engine = MagicMock()
+    engine.get_memory_import_keys = AsyncMock(return_value=set())
+    engine.add_memory = AsyncMock(return_value=1)
+    request = MagicMock()
+    request.get_json = AsyncMock(
+        return_value={
+            "format": "json",
+            "content": json.dumps([{"note": "没有正文也没有对话"}]),
+            "dry_run": False,
+            "duplicate_strategy": "allow",
+        }
+    )
+
+    with patch(
+        "astrbot_plugin_livingmemory.core.page_api_modules.memory_handler_io.request",
+        request,
+    ):
+        result = await handler.import_memories(engine, MemoryProcessor(context=None))
+
+    assert result["data"]["imported_count"] == 0
+    assert result["data"]["failed_count"] == 1
     engine.add_memory.assert_not_awaited()
