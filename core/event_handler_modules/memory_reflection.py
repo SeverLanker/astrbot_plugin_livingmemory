@@ -20,6 +20,7 @@ from ..memory_scope import (
     resolve_memory_scope,
 )
 from ..memory_source import serialize_source_messages
+from ..processors.source_attribution import blocks_user_fact_storage
 from ..utils import get_persona_id
 
 _DEFAULT_MEMORY_SCOPE = object()
@@ -896,6 +897,24 @@ class MemoryReflection:
                         is_group_chat=is_group_chat,
                         persona_id=persona_id,
                     )
+                    if blocks_user_fact_storage(metadata):
+                        logger.info(
+                            f"[{session_id}] 窗口不能作为用户、关系或失联事实的证据，"
+                            f"跳过写入并推进总结游标 [{start_index}:{end_index}]"
+                        )
+                        if not await self._revision_still_valid(
+                            session_id, expected_revision
+                        ):
+                            logger.info(
+                                f"[{session_id}] 会话已回滚（修订号变化），"
+                                "放弃推进无用户证据窗口的游标"
+                            )
+                            return False
+                        if self.conversation_manager is None:
+                            return False
+                        return await self._commit_summary_cursor(
+                            session_id, end_index, expected_revision
+                        )
 
                     atoms = self.memory_processor.classify_atoms_from_metadata(
                         metadata=metadata,

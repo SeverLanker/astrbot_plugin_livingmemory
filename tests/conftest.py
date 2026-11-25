@@ -16,8 +16,9 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PLUGINS_DIR = Path(__file__).resolve().parents[2]
-ASTRBOT_ROOT = Path(__file__).resolve().parents[4]
+_resolved_parents = Path(__file__).resolve().parents
+PLUGINS_DIR = _resolved_parents[2] if len(_resolved_parents) > 2 else PROJECT_ROOT
+ASTRBOT_ROOT = _resolved_parents[4] if len(_resolved_parents) > 4 else PROJECT_ROOT
 
 for candidate in (PROJECT_ROOT, PLUGINS_DIR, ASTRBOT_ROOT):
     candidate_str = str(candidate)

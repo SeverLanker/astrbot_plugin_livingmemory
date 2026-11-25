@@ -16,6 +16,11 @@ from ..astrbot_compat import get_using_provider
 from ..models.conversation_models import Message
 from .memory_processor_parse import MemoryProcessorParseMixin
 from .memory_processor_build import MemoryProcessorBuildMixin
+from .source_attribution import (
+    apply_source_attribution,
+    collect_window_evidence,
+    empty_unattributed_metadata,
+)
 
 class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
     """
@@ -458,6 +463,21 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
         if not messages:
             raise ValueError("消息列表不能为空")
 
+        evidence = collect_window_evidence(messages)
+        if evidence.lacks_user_evidence:
+            logger.info(
+                "[MemoryProcessor] 窗口没有用户发言，跳过用户事实提取并推进调用方游标"
+            )
+            metadata = empty_unattributed_metadata(
+                is_group_chat=is_group_chat,
+                evidence=evidence,
+                reason="no_user_evidence",
+            )
+            metadata["participant_identities"] = self._extract_participant_identities(
+                messages
+            )
+            return "", metadata, 0.0
+
         # 1. 格式化对话历史
         conversation_text = self._format_conversation(messages)
 
@@ -493,8 +513,27 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
             )
             logger.debug(f"[MemoryProcessor] LLM 原始响应内容:\n{llm_response_text}")
 
-            # 4. 解析LLM响应
+            # 4. 解析LLM响应，并去掉助手推测出来的用户状态/关系/失联
             structured_data = self._parse_llm_response(llm_response_text, is_group_chat)
+            structured_data, attribution = apply_source_attribution(
+                structured_data, evidence
+            )
+            if not attribution["store_user_facts"]:
+                logger.info(
+                    "[MemoryProcessor] 总结结果没有可归因的用户事实，跳过写入"
+                )
+                metadata = empty_unattributed_metadata(
+                    is_group_chat=is_group_chat,
+                    evidence=evidence,
+                    reason=str(attribution.get("reason") or "filtered"),
+                    dropped_ungrounded_claims=int(
+                        attribution.get("dropped_ungrounded_claims") or 0
+                    ),
+                )
+                metadata["participant_identities"] = (
+                    self._extract_participant_identities(messages)
+                )
+                return "", metadata, 0.0
 
             # 4.5 质量校验
             quality = self._validate_summary_quality(structured_data)
@@ -516,6 +555,7 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
             metadata["participant_identities"] = self._extract_participant_identities(
                 messages
             )
+            metadata["source_attribution"] = attribution
             content = self._apply_source_time_tags(content, metadata, messages)
             # 将质量标记写入 metadata
             metadata["summary_quality"] = structured_data.get("_quality", "normal")

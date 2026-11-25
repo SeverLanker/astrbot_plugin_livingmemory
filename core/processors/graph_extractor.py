@@ -7,6 +7,7 @@ from typing import Any
 
 from ..models.graph_models import ExtractedGraph, GraphEdge, GraphEntry, GraphNode
 from .entity_resolver import EntityResolver
+from .source_attribution import blocks_user_fact_storage
 
 
 class GraphExtractor:
@@ -30,6 +31,9 @@ class GraphExtractor:
         When atoms are provided, each atom independently contributes nodes
         and edges with per-atom confidence scores instead of hardcoded values.
         """
+        metadata = metadata or {}
+        if blocks_user_fact_storage(metadata):
+            return ExtractedGraph()
         if atoms:
             return self._extract_from_atoms(source_memory_id, atoms, metadata)
         return self._extract_legacy(source_memory_id, content, metadata)

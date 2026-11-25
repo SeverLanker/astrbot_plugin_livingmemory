@@ -10,6 +10,7 @@ from quart import request
 from astrbot.api import logger
 
 from ..memory_source import restore_source_messages
+from ..processors.source_attribution import blocks_user_fact_storage
 from .memory_handler_update import MemoryHandlerUpdateMixin
 from .memory_handler_io import MemoryHandlerIoMixin
 
@@ -258,6 +259,19 @@ class MemoryHandler(MemoryHandlerUpdateMixin, MemoryHandlerIoMixin):
                 is_group_chat=is_group_chat,
                 persona_id=current_metadata.get("persona_id"),
             )
+            if blocks_user_fact_storage(metadata):
+                return self.utils.ok(
+                    {
+                        "skipped": True,
+                        "reason": "no_user_fact_evidence",
+                        "message": (
+                            "原文没有可归因的用户发言，未改写原记忆，"
+                            "也未写入用户、关系或失联事实。"
+                        ),
+                        "old_memory_id": memory_id,
+                        "new_memory_id": memory_id,
+                    }
+                )
             metadata["source_window"] = {
                 **(current_metadata.get("source_window") or {}),
                 "resummarized_from": memory_id,

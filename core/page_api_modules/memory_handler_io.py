@@ -11,6 +11,7 @@ from astrbot.api import logger
 from ..memory_transfer import (    MAX_IMPORT_ENTRIES,    memory_import_key,    parse_transfer_content,    serialize_transfer_csv,    serialize_transfer_json,)
 from quart import request
 from ..memory_source import restore_source_messages
+from ..processors.source_attribution import blocks_user_fact_storage
 import time
 
 
@@ -118,6 +119,7 @@ class MemoryHandlerIoMixin:
 
         imported_ids: list[int] = []
         skipped_duplicates = 0
+        skipped_unattributed = 0
         import_errors = list(parse_errors)
         active_keys = set(existing_keys)
         for entry in entries:
@@ -138,6 +140,9 @@ class MemoryHandlerIoMixin:
                             persona_id=entry.persona_id,
                         )
                     )
+                    if blocks_user_fact_storage(generated_metadata):
+                        skipped_unattributed += 1
+                        continue
                     content_text = generated_content
                     metadata.update(generated_metadata or {})
                     importance = generated_importance
@@ -194,6 +199,7 @@ class MemoryHandlerIoMixin:
                 "total": len(entries) + len(parse_errors),
                 "imported_count": len(imported_ids),
                 "skipped_duplicate_count": skipped_duplicates,
+                "skipped_unattributed_count": skipped_unattributed,
                 "failed_count": len(import_errors),
                 "imported_ids": imported_ids,
                 "errors": import_errors[:50],
